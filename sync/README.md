@@ -145,7 +145,7 @@ granularity keeps everything that pertains to a document in one place.
 
 ## Tooling
 
-Two scripts in `sync/`:
+Three scripts in `sync/`:
 
 ### `decompose.py`
 
@@ -176,6 +176,51 @@ the monolithic file to the tree and back. It is also a reference
 implementation showing that the atomized Atlas can be reassembled into any
 desired presentation form (e.g., the Atlas Portal renders a similar
 reassembly today).
+
+### `migrate-branches.py`
+
+Cutover-only script. Translates open Atlas PRs from monolith format to
+decomposed format atomically. Built on the decompose-twice-and-rewrite
+algorithm:
+
+1. Find merge-base between the PR branch and old-main.
+2. Decompose the merge-base monolith → `base_tree`.
+3. Decompose the branch HEAD's monolith → `head_tree`.
+4. Diff the trees with UUID-aware rename detection: docs whose UUID is the
+   same in both trees but at different paths (and content matches modulo
+   doc_no) emit a `rename` op rather than `(delete, add)` pair, so the
+   migrated PR renders cleanly in code review.
+5. Apply the diff on top of decomposed-main as a single fresh commit, with
+   non-Atlas branch content (research notes, helpers, .github/) preserved
+   verbatim via `git diff merge_base..head -- ':!Sky Atlas/Sky Atlas.md'
+   | git apply`.
+
+```
+python sync/migrate-branches.py --dry-run --all-open
+python sync/migrate-branches.py --apply --pr 245 --report-only
+python sync/migrate-branches.py --apply --all-open --yes
+```
+
+Default with no flags: `--dry-run --all-open`. The script writes per-PR
+JSON + markdown reports to `.scratch/cutover-reports/` (configurable via
+`--report-dir`). Reports include diff summary, conflicts (with expected vs
+actual content + unified diff), and the applied-commit OID.
+
+Safety rails on the `--apply` path:
+
+- Idempotent: if `<branch>-pre-cutover` tag exists AND the branch HEAD has
+  no `Sky Atlas/Sky Atlas.md` AND `content/` is present, the PR is skipped
+  with status `already-migrated`.
+- Tag-then-push: before the force-push to `<branch>`, tag
+  `<branch>-pre-cutover` at the original branch head OID. Rollback is
+  `git push --force <branch>-pre-cutover:<branch>`.
+- Per-PR confirmation prompt unless `--yes` is passed.
+- `--apply --report-only` applies in a temp worktree without pushing —
+  used for the pre-cutover dry-run protocol against `cutover-staging`.
+
+Tests live in `sync/test_migrate_branches.py` (unit) and
+`sync/test_migrate_integration.py` (round-trip against current open PRs in
+`Atlas-Axis/next-gen-atlas-private`).
 
 ### Roundtrip property
 
