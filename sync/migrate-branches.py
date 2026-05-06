@@ -23,11 +23,26 @@ Usage:
                                     [--yes]
                                     [--report-dir PATH]
                                     [--repo-dir PATH]
+                                    [--remote REMOTE]
+                                    [--push-remote REMOTE]
 
 Default with no flags: --dry-run --all-open against
 ~/repos/next-gen-atlas-private. The script lives in the public fork (where
 sync/decompose.py and sync/compose.py live) but operates against the private
 repo's open PRs by default.
+
+Remote configuration:
+  --remote (default `origin`) names the remote that has `pull/<n>/head` virtual
+  refs and the canonical `main` branch — i.e., the repo where the PRs were
+  opened. Used for fetch + merge-base lookups.
+
+  --push-remote (default = --remote) names the remote where branches live and
+  pushes go. Differs from --remote when working with forked PRs: e.g. clone
+  sky-ecosystem/next-gen-atlas as `origin` (--remote origin), add your fork as
+  `fork` (--push-remote fork). The script fetches `pull/<n>/head` from --remote,
+  resolves `main` as `<remote>/main`, fetches branch refs from --push-remote,
+  resolves branch trees as `<push-remote>/<branch>`, and pushes the migrated
+  commit + pre-cutover tag to --push-remote.
 """
 
 from __future__ import annotations
@@ -361,15 +376,23 @@ def diff_trees(base: dict[str, str], head: dict[str, str]) -> DiffSummary:
 # Git operations (G2 fetch path, G7 stale-cache safety)
 # ---------------------------------------------------------------------------
 
-def fetch_origin_prune(repo: Path) -> None:
-    """`git fetch origin --prune` — call once at script start (G7)."""
-    sh(["git", "fetch", "origin", "--prune"], cwd=repo)
+def fetch_remote_prune(repo: Path, remote: str) -> None:
+    """`git fetch <remote> --prune` — call at script start (G7).
+
+    Call once per distinct remote in use (i.e., once if --remote == --push-remote,
+    twice if they differ).
+    """
+    sh(["git", "fetch", remote, "--prune"], cwd=repo)
 
 
-def fetch_pr_head(repo: Path, pr_number: int) -> str:
-    """Fetch PR head via `pull/<n>/head:pr-<n>-head` (G2). Returns local ref name."""
+def fetch_pr_head(repo: Path, pr_number: int, remote: str = "origin") -> str:
+    """Fetch PR head via `pull/<n>/head:pr-<n>-head` (G2). Returns local ref name.
+
+    `remote` must point at the base repo where the PR was opened — that's where
+    `pull/<n>/head` virtual refs live, even for PRs opened from a fork.
+    """
     local_ref = f"pr-{pr_number}-head"
-    sh(["git", "fetch", "origin", f"pull/{pr_number}/head:{local_ref}", "--force"],
+    sh(["git", "fetch", remote, f"pull/{pr_number}/head:{local_ref}", "--force"],
        cwd=repo)
     return local_ref
 
@@ -443,27 +466,30 @@ class MigrationResult:
 # Idempotency (G5)
 # ---------------------------------------------------------------------------
 
-def is_already_migrated(repo: Path, branch: str) -> bool:
+def is_already_migrated(repo: Path, branch: str, push_remote: str = "origin") -> bool:
     """Check whether the branch looks already-migrated.
 
     Criteria (all must hold):
       1. Tag `<branch>-pre-cutover` exists.
       2. The branch HEAD does NOT contain `Sky Atlas/Sky Atlas.md`.
       3. The branch HEAD contains the `content/` directory.
+
+    Branch is read at `<push_remote>/<branch>` — that's where the migrated
+    branch lives (and where we'd push the migration to).
     """
     pre_cutover_tag = f"{branch}-pre-cutover"
     if not tag_exists(repo, pre_cutover_tag):
         return False
 
-    # Look at the branch's tree at HEAD via origin/<branch>
+    # Look at the branch's tree at HEAD via <push_remote>/<branch>
     try:
         # Check Sky Atlas.md is gone
-        proc = sh(["git", "cat-file", "-e", f"origin/{branch}:{ATLAS_PATH}"],
+        proc = sh(["git", "cat-file", "-e", f"{push_remote}/{branch}:{ATLAS_PATH}"],
                   cwd=repo, check=False)
         if proc.returncode == 0:
             return False  # monolith still present
         # Check content/_index.md exists
-        proc = sh(["git", "cat-file", "-e", f"origin/{branch}:content/_index.md"],
+        proc = sh(["git", "cat-file", "-e", f"{push_remote}/{branch}:content/_index.md"],
                   cwd=repo, check=False)
         if proc.returncode != 0:
             return False
@@ -790,8 +816,15 @@ def compute_migration(
     pr_meta: dict,
     *,
     do_pr_fetch: bool = True,
+    remote: str = "origin",
+    push_remote: str = "origin",
 ) -> MigrationResult:
-    """Compute the diff for one PR. Pure read — no writes."""
+    """Compute the diff for one PR. Pure read — no writes.
+
+    `remote` is where `pull/<n>/head` and `main` live (the base repo of the PR).
+    `push_remote` is where the branch ref lives (typically the head/fork repo).
+    For single-repo workflows they're the same; for forked PRs they differ.
+    """
     branch = pr_meta["headRefName"]
     result = MigrationResult(
         pr_number=pr_meta["number"],
@@ -804,20 +837,21 @@ def compute_migration(
         # G2: fetch via pull/<n>/head to guarantee the OID is locally available.
         if do_pr_fetch:
             try:
-                fetch_pr_head(repo, pr_meta["number"])
+                fetch_pr_head(repo, pr_meta["number"], remote)
             except subprocess.CalledProcessError as e:
-                # Fall back to fetching the branch ref directly.
+                # Fall back to fetching the branch ref directly from push_remote
+                # (which is where the head branch lives for forked PRs).
                 try:
-                    sh(["git", "fetch", "origin", branch], cwd=repo, check=True)
+                    sh(["git", "fetch", push_remote, branch], cwd=repo, check=True)
                 except subprocess.CalledProcessError as e2:
                     result.status = "error"
                     result.error = f"fetch failed: {e.stderr.strip()} / {e2.stderr.strip()}"
                     return result
 
         head_ref = pr_meta["headRefOid"]
-        # Find merge-base with origin/main
+        # Find merge-base with <remote>/main
         try:
-            merge_base = get_merge_base(repo, "origin/main", head_ref)
+            merge_base = get_merge_base(repo, f"{remote}/main", head_ref)
         except subprocess.CalledProcessError as e:
             result.status = "error"
             result.error = f"merge-base failure: {e.stderr.strip()}"
@@ -860,12 +894,15 @@ def apply_migration(
     report_only: bool = False,
     workdir: Optional[Path] = None,
     push: bool = False,
+    push_remote: str = "origin",
 ) -> MigrationResult:
     """Apply the migration for one PR. Updates result in place.
 
     If `report_only` is True, applies in a temp worktree and does NOT push.
-    Otherwise (when push=True), pushes the migrated branch back to origin
-    after tagging `<branch>-pre-cutover`.
+    Otherwise (when push=True), pushes the migrated branch back to `push_remote`
+    after tagging `<branch>-pre-cutover`. `push_remote` is the remote where the
+    head branch lives — the fork repo for forked PRs, the canonical repo for
+    single-repo workflows.
 
     `workdir` lets callers supply their own temp directory (used for the
     round-trip test). If omitted, a temp dir is created and removed.
@@ -921,9 +958,9 @@ def apply_migration(
             pre_cutover_tag = f"{branch}-pre-cutover"
             if not tag_exists(repo, pre_cutover_tag):
                 sh(["git", "tag", pre_cutover_tag, head_ref], cwd=repo)
-                sh(["git", "push", "origin", f"refs/tags/{pre_cutover_tag}"], cwd=repo)
-            # Force-push the new commit to <branch>.
-            sh(["git", "push", "--force-with-lease", "origin",
+                sh(["git", "push", push_remote, f"refs/tags/{pre_cutover_tag}"], cwd=repo)
+            # Force-push the new commit to <branch> on push_remote.
+            sh(["git", "push", "--force-with-lease", push_remote,
                 f"{commit_oid}:refs/heads/{branch}"], cwd=repo)
     finally:
         if cleanup:
@@ -1152,8 +1189,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--public-repo-dir", type=Path,
                     default=Path("/Users/adamfraser/repos/next-gen-atlas"),
                     help="Public-fork repo path (used to resolve --decomposed-main).")
+    ap.add_argument("--remote", default="origin",
+                    help="Remote with `pull/<n>/head` virtual refs and `main` "
+                         "(the PR base repo). Default `origin`.")
+    ap.add_argument("--push-remote", default=None,
+                    help="Remote where the head branch lives and pushes go. "
+                         "Differs from --remote for forked PRs (--remote points at "
+                         "the upstream/base repo, --push-remote at the fork). "
+                         "Default: same as --remote.")
     ap.add_argument("--no-fetch", action="store_true",
-                    help="Skip the initial `git fetch origin --prune` (testing only).")
+                    help="Skip the initial `git fetch <remote> --prune` (testing only).")
     return ap.parse_args(argv)
 
 
@@ -1176,6 +1221,8 @@ def select_prs(repo: Path, args: argparse.Namespace) -> list[dict]:
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
     repo = args.repo_dir
+    remote = args.remote
+    push_remote = args.push_remote or args.remote
     apply_mode = args.apply
     dry_run = args.dry_run or (not args.apply)
 
@@ -1185,7 +1232,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if not args.no_fetch:
         try:
-            fetch_origin_prune(repo)
+            fetch_remote_prune(repo, remote)
+            if push_remote != remote:
+                fetch_remote_prune(repo, push_remote)
         except subprocess.CalledProcessError as e:
             print(f"WARN: initial git fetch failed: {e.stderr}", file=sys.stderr)
 
@@ -1203,7 +1252,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     for pr_meta in prs:
         # Idempotency check (G5).
         branch = pr_meta["headRefName"]
-        if apply_mode and is_already_migrated(repo, branch):
+        if apply_mode and is_already_migrated(repo, branch, push_remote):
             r = MigrationResult(
                 pr_number=pr_meta["number"],
                 branch=branch,
@@ -1214,7 +1263,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             results.append(r)
             continue
 
-        result = compute_migration(repo, pr_meta)
+        result = compute_migration(repo, pr_meta, remote=remote,
+                                   push_remote=push_remote)
         results.append(result)
 
         if apply_mode and result.status == "migrate-able":
@@ -1229,6 +1279,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 decomposed_main=decomposed_main,
                 report_only=args.report_only,
                 push=not args.report_only,
+                push_remote=push_remote,
             )
 
         # Always write a report when --apply.
